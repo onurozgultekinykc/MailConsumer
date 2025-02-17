@@ -15,7 +15,7 @@ RUN dotnet publish -c Release -o /out
 # Çalýþtýrma için temel imaj olarak .NET Runtime kullan
 FROM mcr.microsoft.com/dotnet/aspnet:8.0
 
-# Çalýþma dizinini ayarla
+# Çalýþma dizinini ayarlan
 WORKDIR /app
 
 # Yayýnlanan dosyalarý kopyala
