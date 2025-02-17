@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'MailConsumerRabbitMQ/Dockerfile'
 jobs:
   publish_images:
     runs-on: ubuntu-latest
