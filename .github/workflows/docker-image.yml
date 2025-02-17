@@ -3,7 +3,9 @@ name: Docker Image CI
 on:
   push:
     branches:
-      - release
+      - main
+    paths:
+      - 'MailConsumerRabbitMQ/Dockerfile'
 jobs:
   publish_images:
     runs-on: ubuntu-latest
