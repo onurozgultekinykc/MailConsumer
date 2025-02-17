@@ -1,0 +1,14 @@
+name: Docker Image CI
+on:
+ [workflow_dispatch]
+jobs:
+  publish_images:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: build image
+        run: docker build ./MailConsumerRabbitMQ -t unholyw4r/consumermail:latest
+      - name: push image to docker hub
+        run: |
+          docker push unholyw4r/consumermail:latest
