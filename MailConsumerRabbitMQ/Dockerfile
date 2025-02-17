@@ -1,36 +1,25 @@
-# Runtime image
-FROM mcr.microsoft.com/dotnet/runtime:8.0 AS base
-WORKDIR /app
-
-# Build image
+# Temel imaj olarak .NET SDK kullan
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
-WORKDIR /src
 
-# Projeyi kopyala
-COPY ["MailConsumerRabbitMQ/MailConsumerRabbitMQ.csproj", "MailConsumerRabbitMQ/"]
-
-# Baðýmlýlýklarý yükle
-RUN dotnet restore "MailConsumerRabbitMQ/MailConsumerRabbitMQ.csproj"
-
-# Kalan dosyalarý kopyala
-COPY . . 
-
-# Proje dizinine geçiþ yap
-WORKDIR "/src/MailConsumerRabbitMQ"
-
-# Build et
-RUN dotnet build "MailConsumerRabbitMQ.csproj" -c Release -o /app/build
-
-# Publish iþlemi
-FROM build AS publish
-RUN dotnet publish "MailConsumerRabbitMQ.csproj" -c Release -o /app/publish /p:UseAppHost=false
-
-# Final image
-FROM base AS final
+# Çalýþma dizinini ayarla
 WORKDIR /app
 
-# Publish'ten kopyalanan dosyalarý al
-COPY --from=publish /app/publish .
+# Proje dosyasýný kopyala ve baðýmlýlýklarý yükle
+COPY *.csproj ./
+RUN dotnet restore
 
-# Program.cs içindeki Main metodunu çalýþtýr
+# Uygulamayý derle
+COPY . ./
+RUN dotnet publish -c Release -o /out
+
+# Çalýþtýrma için temel imaj olarak .NET Runtime kullan
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+
+# Çalýþma dizinini ayarla
+WORKDIR /app
+
+# Yayýnlanan dosyalarý kopyala
+COPY --from=build /out .
+
+# Uygulamayý çalýþtýr
 ENTRYPOINT ["dotnet", "MailConsumerRabbitMQ.dll"]
