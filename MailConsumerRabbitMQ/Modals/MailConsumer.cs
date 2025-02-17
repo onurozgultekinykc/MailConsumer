@@ -55,10 +55,17 @@ namespace MailConsumerRabbitMQ.Modals
                 try
                 {
                     var mailProperties = JsonConvert.DeserializeObject<MessageMQMail>(message);
-                    if (mailProperties != null)
+                 
+                    if (mailProperties != null&&mailProperties.MailVM!=null)
                     {
                         await SendEmail(mailProperties);
                         await _channel.BasicAckAsync(ea.DeliveryTag, false); // Mesaj işlendiyse onayla
+                    }
+                    else
+                    {
+                        var mailPropertiess = JsonConvert.DeserializeObject<MessageMQMailMultiple>(message);
+                        await SendEmailMultiple(mailPropertiess);
+                        await _channel.BasicAckAsync(ea.DeliveryTag, false);
                     }
                 }
                 catch (Exception ex)
@@ -103,6 +110,50 @@ namespace MailConsumerRabbitMQ.Modals
                 await smtpClient.DisconnectAsync(true);
 
                 Console.WriteLine(sayac+")"+_mail.MailVM.Subject+" Mail başarıyla gönderildi.");
+                sayac++;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Mail gönderme hatası: {ex.Message}");
+                throw;
+            }
+        }
+        private async Task SendEmailMultiple(MessageMQMailMultiple _mail)
+        {
+            try
+            {
+                MimeMessage mimeMessage = new MimeMessage();
+                mimeMessage.From.Add(MailboxAddress.Parse($"{_mail.ExternalMailAddress} <{_mail.ExternalMailAddress}>"));
+                mimeMessage.To.Add(MailboxAddress.Parse($"{_mail.MailMultiVM.BoxName} <{_mail.MailMultiVM.To}>"));
+                mimeMessage.Subject = _mail.MailMultiVM.Subject;
+                var bodyBuilder = new BodyBuilder();
+                bodyBuilder.HtmlBody = _mail.MailMultiVM.Body;
+
+                List<MailboxAddress> toAddresses = new List<MailboxAddress>();
+                foreach (string email in _mail.MailMultiVM.ToMultiple)
+                {
+                    MailboxAddress recipient = new MailboxAddress(email, email);
+                    mimeMessage.To.Add(recipient);
+                }
+
+                if (_mail.MailMultiVM.Files != null && _mail.MailMultiVM.Files.Count > 0)
+                {
+                    foreach (var file in _mail.MailMultiVM.Files)
+                    {
+                        using var memoryStream = new MemoryStream();
+                        file.CopyTo(memoryStream);
+                        memoryStream.Seek(0, SeekOrigin.Begin);
+                        bodyBuilder.Attachments.Add(file.FileName, memoryStream);
+                    }
+                }
+                mimeMessage.Body = bodyBuilder.ToMessageBody();
+                using var smtpClient = new SmtpClient();
+                await smtpClient.ConnectAsync(_mail.ExternalSmpt, _mail.ExternalPort, _mail.ExternalSsl);
+                await smtpClient.AuthenticateAsync(_mail.ExternalMailAddress, _mail.ExternalConnectionKey);
+                await smtpClient.SendAsync(mimeMessage);
+                await smtpClient.DisconnectAsync(true);
+
+                Console.WriteLine(sayac+")"+_mail.MailMultiVM.Subject+" Mail başarıyla gönderildi.");
                 sayac++;
             }
             catch (Exception ex)
