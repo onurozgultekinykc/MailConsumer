@@ -26,8 +26,8 @@ namespace MailConsumerRabbitMQ.Modals
             {
                 Port = 5672,
                 HostName = "c_rabbitmq",
-                UserName = "guest",
-                Password = "guest",
+                UserName = "user",
+                Password = "1234567",
             
             };
 
