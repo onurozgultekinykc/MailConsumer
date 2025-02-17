@@ -8,7 +8,7 @@ using System.Threading.Tasks;
 namespace MailConsumerRabbitMQ.Modals
 {
     public class MailVM
-    {
+    {//
         public Guid MailId { get; set; }
         /// <summary>
         /// Gets or Sets the subject.
