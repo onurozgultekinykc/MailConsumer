@@ -24,8 +24,8 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t your-dockerhub-username/your-image-name:${{ github.sha }} .
+          docker build -t your-dockerhub-username/your-image-name:latest .
           
       - name: Push Docker image
         run: |
-          docker push your-dockerhub-username/your-image-name:${{ github.sha }}
+          docker push your-dockerhub-username/your-image-name:latest
