@@ -21,5 +21,5 @@ WORKDIR /app
 # Yayýnlanan dosyalarý kopyala
 COPY --from=build /out .
 
-# Uygulamayý çalýþtýr
+# Uygulamayý çalýþtýrs
 ENTRYPOINT ["dotnet", "MailConsumerRabbitMQ.dll"]
