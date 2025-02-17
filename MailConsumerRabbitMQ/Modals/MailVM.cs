@@ -11,7 +11,7 @@ namespace MailConsumerRabbitMQ.Modals
     {//
         public Guid MailId { get; set; }
         /// <summary>
-        /// Gets or Sets the subject.
+        /// Gets or Sets the subjects.
         /// </summary>
         /// <value>A string.</value>
         public string Subject { get; set; }
