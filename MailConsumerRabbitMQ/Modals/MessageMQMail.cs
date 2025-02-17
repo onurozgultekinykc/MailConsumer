@@ -18,6 +18,8 @@ namespace MailConsumerRabbitMQ.Modals
         public bool ExternalSsl { get; set; }
         public MailVM MailVM { get; set; }
         public MailVmMultiple MailMultiVM { get; set; }
+        public List<string> fileByteArrays { get; set; }
+        public List<string> fileFullName { get; set; }
     }
     public class MessageMQMailMultiple
     {
@@ -35,5 +37,7 @@ namespace MailConsumerRabbitMQ.Modals
         public bool ExternalSsl { get; set; }
         public MailVmMultiple MailMultiVM { get; set; }
         public MailVM MailVM { get; set; }
+        public List<string> fileByteArrays { get; set; }
+        public List<string> fileFullName { get; set; }
     }
 }

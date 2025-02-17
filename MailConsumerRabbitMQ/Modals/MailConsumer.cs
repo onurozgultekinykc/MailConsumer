@@ -4,6 +4,8 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using MailKit.Net.Smtp;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Internal;
 using MimeKit;
 using Newtonsoft.Json;
 using RabbitMQ.Client;
@@ -92,6 +94,29 @@ namespace MailConsumerRabbitMQ.Modals
                 mimeMessage.Subject = _mail.MailVM.Subject;
                 var bodyBuilder = new BodyBuilder();
                 bodyBuilder.HtmlBody = _mail.MailVM.Body;
+
+                if (_mail.fileByteArrays != null && _mail.fileByteArrays.Count > 0)
+                {
+                    _mail.MailVM.Files = new List<IFormFile>();
+
+                    for (int index = 0; index < _mail.fileByteArrays.Count; index++)
+                    {
+                        string base64File = _mail.fileByteArrays[index]; // Base64 kodlu dosya
+                        string fileFullName = _mail.fileFullName[index]; // Dosya adı (tam ad ve uzantı)
+
+                        byte[] fileBytes = Convert.FromBase64String(base64File); // Base64'ü byte dizisine çevir
+                        var stream = new MemoryStream(fileBytes); // Byte dizisini Stream'e çevir
+
+                        var file = new FormFile(stream, 0, fileBytes.Length, "file", fileFullName) // Özel isim verebilirsin
+                        {
+                            Headers = new HeaderDictionary(),
+                            ContentType = "application/octet-stream"
+                        };
+
+                        _mail.MailVM.Files.Add(file); // Yeni IFormFile nesnesini listeye ekle
+                    }
+
+                }
                 if (_mail.MailVM.Files != null && _mail.MailVM.Files.Count > 0)
                 {
                     foreach (var file in _mail.MailVM.Files)
@@ -136,9 +161,31 @@ namespace MailConsumerRabbitMQ.Modals
                     mimeMessage.To.Add(recipient);
                 }
 
-                if (_mail.MailMultiVM.Files != null && _mail.MailMultiVM.Files.Count > 0)
+                if (_mail.fileByteArrays != null && _mail.fileByteArrays.Count > 0)
                 {
-                    foreach (var file in _mail.MailMultiVM.Files)
+                    _mail.MailVM.Files = new List<IFormFile>();
+
+                    for (int index = 0; index < _mail.fileByteArrays.Count; index++)
+                    {
+                        string base64File = _mail.fileByteArrays[index]; // Base64 kodlu dosya
+                        string fileFullName = _mail.fileFullName[index]; // Dosya adı (tam ad ve uzantı)
+
+                        byte[] fileBytes = Convert.FromBase64String(base64File); // Base64'ü byte dizisine çevir
+                        var stream = new MemoryStream(fileBytes); // Byte dizisini Stream'e çevir
+
+                        var file = new FormFile(stream, 0, fileBytes.Length, "file", fileFullName) // Özel isim verebilirsin
+                        {
+                            Headers = new HeaderDictionary(),
+                            ContentType = "application/octet-stream"
+                        };
+
+                        _mail.MailVM.Files.Add(file); // Yeni IFormFile nesnesini listeye ekle
+                    }
+
+                }
+                if (_mail.MailVM.Files != null && _mail.MailVM.Files.Count > 0)
+                {
+                    foreach (var file in _mail.MailVM.Files)
                     {
                         using var memoryStream = new MemoryStream();
                         file.CopyTo(memoryStream);
