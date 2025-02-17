@@ -12,5 +12,5 @@ jobs:
         run: docker build ./MailConsumerRabbitMQ -t unholyw4r/consumermail:latest
       - name: push image to docker hub
         run: |
-          docker login u- unholyw4r -p ${{ secrets.DOCKER_HUB_TOKEN }}
+          docker login -u unholyw4r -p ${{ secrets.DOCKER_HUB_TOKEN }}
           docker push unholyw4r/consumermail:latest
