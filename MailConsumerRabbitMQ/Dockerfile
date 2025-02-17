@@ -18,7 +18,7 @@ FROM mcr.microsoft.com/dotnet/aspnet:8.0
 # Çalýþma dizinini ayarlan
 WORKDIR /app
 
-# Yayýnlanan dosyalarý kopyala
+# Yayýnlanan dosyalarý kopyalad
 COPY --from=build /out .
 
 # Uygulamayý çalýþtýrs
