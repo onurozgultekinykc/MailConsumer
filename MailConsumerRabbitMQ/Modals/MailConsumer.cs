@@ -25,7 +25,8 @@ namespace MailConsumerRabbitMQ.Modals
             _factory = new ConnectionFactory
             {
                 Port = 5672,
-                HostName = "c_rabbitmq",
+                //HostName = "c_rabbitmq",
+                HostName = "192.168.1.76",
                 UserName = "user",
                 Password = "1234567",
             
@@ -134,7 +135,7 @@ namespace MailConsumerRabbitMQ.Modals
                 await smtpClient.SendAsync(mimeMessage);
                 await smtpClient.DisconnectAsync(true);
 
-                Console.WriteLine(sayac+")"+_mail.MailVM.Subject+" Mail başarıyla gönderildi.");
+                Console.WriteLine(sayac+")"+_mail.MailVM.Subject+" Mail başarıyla gönderildi."+ DateTime.Now.ToString("dd-MMM HH:m:s") + " "+_mail.MailVM.To);
                 sayac++;
             }
             catch (Exception ex)
@@ -149,15 +150,17 @@ namespace MailConsumerRabbitMQ.Modals
             {
                 MimeMessage mimeMessage = new MimeMessage();
                 mimeMessage.From.Add(MailboxAddress.Parse($"{_mail.ExternalMailAddress} <{_mail.ExternalMailAddress}>"));
-                mimeMessage.To.Add(MailboxAddress.Parse($"{_mail.MailMultiVM.BoxName} <{_mail.MailMultiVM.To}>"));
+              
+                foreach (var item in _mail.MailMultiVM.ToMultipleBoxAdress)
+                    mimeMessage.To.Add(MailboxAddress.Parse($"{item.Item1} <{item.Item2}>"));
                 mimeMessage.Subject = _mail.MailMultiVM.Subject;
                 var bodyBuilder = new BodyBuilder();
                 bodyBuilder.HtmlBody = _mail.MailMultiVM.Body;
 
                 List<MailboxAddress> toAddresses = new List<MailboxAddress>();
-                foreach (string email in _mail.MailMultiVM.ToMultiple)
+                foreach ((string item,string item2) in _mail.MailMultiVM.ToMultipleBoxAdress)
                 {
-                    MailboxAddress recipient = new MailboxAddress(email, email);
+                    MailboxAddress recipient = new MailboxAddress(item, item2);
                     mimeMessage.To.Add(recipient);
                 }
 
@@ -183,9 +186,9 @@ namespace MailConsumerRabbitMQ.Modals
                     }
 
                 }
-                if (_mail.MailVM.Files != null && _mail.MailVM.Files.Count > 0)
+                if (_mail.MailMultiVM.Files != null && _mail.MailMultiVM.Files.Count > 0)
                 {
-                    foreach (var file in _mail.MailVM.Files)
+                    foreach (var file in _mail.MailMultiVM.Files)
                     {
                         using var memoryStream = new MemoryStream();
                         file.CopyTo(memoryStream);
@@ -200,8 +203,14 @@ namespace MailConsumerRabbitMQ.Modals
                 await smtpClient.SendAsync(mimeMessage);
                 await smtpClient.DisconnectAsync(true);
 
-                Console.WriteLine(sayac+")"+_mail.MailMultiVM.Subject+" Mail başarıyla gönderildi.");
-                sayac++;
+                foreach (var item in _mail.MailMultiVM.ToMultipleBoxAdress)
+                {
+                    Console.WriteLine(sayac+")"+_mail.MailMultiVM.Subject+" Mail başarıyla gönderildi."+ DateTime.Now.ToString("dd-MMM HH:m:s") + " "+item.Item1);
+                    sayac++;
+                }
+             
+            
+                
             }
             catch (Exception ex)
             {
