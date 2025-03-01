@@ -25,8 +25,8 @@ namespace MailConsumerRabbitMQ.Modals
             _factory = new ConnectionFactory
             {
                 Port = 5672,
-                HostName = "c_rabbitmq",
-                //HostName = "192.168.1.76",
+                //HostName = "c_rabbitmq",
+                HostName = "192.168.1.76",
                 UserName = "user",
                 Password = "1234567",
             
@@ -158,9 +158,11 @@ namespace MailConsumerRabbitMQ.Modals
                 bodyBuilder.HtmlBody = _mail.MailMultiVM.Body;
 
                 List<MailboxAddress> toAddresses = new List<MailboxAddress>();
+                string sendedTo = "";
                 foreach ((string item,string item2) in _mail.MailMultiVM.ToMultipleBoxAdress)
                 {
                     MailboxAddress recipient = new MailboxAddress(item, item2);
+                    sendedTo+=item2+",";
                     mimeMessage.To.Add(recipient);
                 }
 
@@ -203,14 +205,11 @@ namespace MailConsumerRabbitMQ.Modals
                 await smtpClient.SendAsync(mimeMessage);
                 await smtpClient.DisconnectAsync(true);
 
-                foreach (var item in _mail.MailMultiVM.ToMultipleBoxAdress)
-                {
-                    Console.WriteLine(sayac+")"+_mail.MailMultiVM.Subject+" Mail başarıyla gönderildi."+ DateTime.Now.ToString("dd-MMM HH:m:s") + " "+item.Item1);
-                    sayac++;
-                }
-             
-            
-                
+                Console.WriteLine(sayac+")"+_mail.MailMultiVM.Subject+" Mail başarıyla gönderildi."+ DateTime.Now.ToString("dd-MMM HH:m:s") + "=> "+sendedTo);
+
+
+
+
             }
             catch (Exception ex)
             {
