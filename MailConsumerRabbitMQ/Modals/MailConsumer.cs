@@ -1,4 +1,5 @@
-﻿using System.Text;
+﻿using System.Collections.Concurrent;
+using System.Text;
 using MailKit.Net.Smtp;
 using MailKit.Security;
 using Microsoft.AspNetCore.Http;
@@ -18,13 +19,15 @@ namespace MailConsumerRabbitMQ.Modals
 
         public int sayac = 1;
 
+        // SMTP session cache (host+port+user)
+        private readonly ConcurrentDictionary<string, SmtpSession> _smtpSessions = new();
+
         public async Task InitializeAsync()
         {
             _factory = new ConnectionFactory
             {
                 Port = 5672,
                 HostName = "c_rabbitmq",
-                //HostName = "192.168.1.76",
                 UserName = "user",
                 Password = "1234567",
             };
@@ -39,7 +42,8 @@ namespace MailConsumerRabbitMQ.Modals
                 autoDelete: false,
                 arguments: null);
 
-            await Task.CompletedTask;
+            // ✅ aynı anda çok mesaj çekip aynı SMTP hesabına abanmasın
+            await _channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false);
         }
 
         public void StartListening()
@@ -58,7 +62,6 @@ namespace MailConsumerRabbitMQ.Modals
                     if (mailProperties != null && mailProperties.MailVM != null)
                     {
                         await SendEmail(mailProperties);
-                        await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
                     }
                     else
                     {
@@ -67,15 +70,29 @@ namespace MailConsumerRabbitMQ.Modals
                             throw new InvalidOperationException("MQ message parse edildi ama null döndü (MessageMQMailMultiple).");
 
                         await SendEmailMultiple(mailMultiple);
-                        await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
                     }
+
+                    await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"Mail gönderme hatası: {ex.Message}");
 
-                    // ✅ Mesajı kaybetme. (Kuyruğu bozmaz, sadece tekrar denersin.)
-                    await _channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
+                    // ❌ requeue:true YOK
+                    // ✅ Mesaj kaybolmasın: ACK'leme.
+                    // ✅ RabbitMQ unacked mesajı geri alsın diye consumer bağlantısını resetliyoruz.
+                    try
+                    {
+                        if (_channel != null && _channel.IsOpen)
+                            await _channel.CloseAsync();
+
+                        if (_connection != null && _connection.IsOpen)
+                            await _connection.CloseAsync();
+                    }
+                    catch { /* ignore */ }
+
+                    // throw: servis/supervisor yeniden başlatıyorsa tekrar Initialize + Consume olur
+                    throw;
                 }
             };
 
@@ -88,26 +105,141 @@ namespace MailConsumerRabbitMQ.Modals
         }
 
         // -------------------------
+        // SMTP session wrapper
+        // -------------------------
+        private sealed class SmtpSession : IAsyncDisposable
+        {
+            public readonly SmtpClient Client = new();
+            public readonly SemaphoreSlim Gate = new(1, 1);
+
+            public bool IsConnected => Client.IsConnected;
+            public bool IsAuthed => Client.IsAuthenticated;
+
+            public async ValueTask DisposeAsync()
+            {
+                try
+                {
+                    if (Client.IsConnected)
+                        await Client.DisconnectAsync(true);
+                }
+                catch { /* ignore */ }
+
+                Client.Dispose();
+                Gate.Dispose();
+            }
+        }
+
+        private string SessionKey(string host, int port, string user)
+            => $"{host}:{port}:{user}".ToLowerInvariant();
+
+        // -------------------------
         // SMTP helpers (dinamik TLS)
         // -------------------------
         private static SecureSocketOptions ResolveSocketOptions(string? host, int port, bool externalSslFlag)
         {
-            // Gmail/SMTP genel doğru kullanım:
-            // 465 => SSL-on-connect
-            // 587 => STARTTLS
             if (port == 465) return SecureSocketOptions.SslOnConnect;
             if (port == 587) return SecureSocketOptions.StartTls;
 
-            // Gmail özel tolerans
             if (!string.IsNullOrWhiteSpace(host) &&
                 host.Contains("gmail", StringComparison.OrdinalIgnoreCase))
             {
-                // 25 gibi portlarda StartTlsWhenAvailable daha mantıklı
                 return externalSslFlag ? SecureSocketOptions.SslOnConnect : SecureSocketOptions.StartTlsWhenAvailable;
             }
 
-            // Genel fallback: flag true => SslOnConnect, değilse StartTlsWhenAvailable
             return externalSslFlag ? SecureSocketOptions.SslOnConnect : SecureSocketOptions.StartTlsWhenAvailable;
+        }
+
+        private static bool IsGmailTooManyLogin(Exception ex)
+        {
+            var s = ex.ToString();
+            return s.Contains("4.7.0", StringComparison.OrdinalIgnoreCase) &&
+                   s.Contains("Too many login attempts", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private async Task<SmtpSession> GetOrCreateSessionAsync(string host, int port, bool ssl, string user, string pass)
+        {
+            var key = SessionKey(host, port, user);
+
+            var session = _smtpSessions.GetOrAdd(key, _ => new SmtpSession());
+
+            // session'ı burada hemen connect etmiyoruz; send içinde lazy yapacağız.
+            // ama bozuk session olursa Remove edip yenisini kuracağız.
+            return session;
+        }
+
+        private async Task EnsureConnectedAndAuthedAsync(SmtpSession session, string host, int port, bool ssl, string user, string pass)
+        {
+            // Not: Gate ile dışarıdan serialize ediyoruz, burada paralel giriş yok.
+            if (!session.Client.IsConnected)
+            {
+                session.Client.CheckCertificateRevocation = true;
+                session.Client.Timeout = 60_000;
+
+                var options = ResolveSocketOptions(host, port, ssl);
+                await session.Client.ConnectAsync(host, port, options);
+            }
+
+            if (!session.Client.IsAuthenticated)
+            {
+                await session.Client.AuthenticateAsync(user, pass);
+            }
+        }
+
+        private async Task SendWithSessionRetryAsync(
+            string host, int port, bool ssl, string user, string pass,
+            MimeMessage mimeMessage,
+            string logPrefix)
+        {
+            var session = await GetOrCreateSessionAsync(host, port, ssl, user, pass);
+            var key = SessionKey(host, port, user);
+
+            // kısa retry: aynı session ile dene; gerekiyorsa resetle
+            var delaysMs = new[] { 0, 1000, 2000, 4000 }; // 4 deneme
+
+            for (int attempt = 0; attempt < delaysMs.Length; attempt++)
+            {
+                if (delaysMs[attempt] > 0)
+                    await Task.Delay(delaysMs[attempt]);
+
+                await session.Gate.WaitAsync();
+                try
+                {
+                    // bağlı mı / authed mi kontrol et, değilse bağlan
+                    await EnsureConnectedAndAuthedAsync(session, host, port, ssl, user, pass);
+
+                    await session.Client.SendAsync(mimeMessage);
+
+                    // ✅ başarılı
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    var gmailThrottle = IsGmailTooManyLogin(ex);
+
+                    Console.WriteLine($"{logPrefix} attempt={attempt + 1}/{delaysMs.Length} err={ex.GetType().Name} msg={ex.Message}");
+
+                    // Gmail throttle / server disconnect gibi durumda session çoğu zaman bozulur.
+                    // Session'ı resetleyip bir sonraki attempt'te fresh connect yaptır.
+                    if (gmailThrottle || !session.Client.IsConnected)
+                    {
+                        // session'ı tamamen yenile
+                        _smtpSessions.TryRemove(key, out _);
+
+                        try { await session.DisposeAsync(); } catch { /* ignore */ }
+
+                        session = new SmtpSession();
+                        _smtpSessions[key] = session;
+                    }
+
+                    // son attempt ise throw
+                    if (attempt == delaysMs.Length - 1)
+                        throw;
+                }
+                finally
+                {
+                    session.Gate.Release();
+                }
+            }
         }
 
         private static void AddAttachmentsFromMailVm(BodyBuilder bodyBuilder, IList<IFormFile>? files)
@@ -120,13 +252,11 @@ namespace MailConsumerRabbitMQ.Modals
 
                 using var ms = new MemoryStream();
                 file.CopyTo(ms);
-
-                // ✅ stream dispose olsa bile bytes ile eklediğimiz için problem yok
                 bodyBuilder.Attachments.Add(file.FileName, ms.ToArray());
             }
         }
 
-        private static void FillFilesFromBase64IfAny(MessageMQMail mail, ref int attCount, ref long attBytes)
+        private static void FillFilesFromBase64IfAny(MessageMQMail mail)
         {
             if (mail.fileByteArrays == null || mail.fileByteArrays.Count == 0) return;
 
@@ -138,9 +268,6 @@ namespace MailConsumerRabbitMQ.Modals
                 var fileFullName = mail.fileFullName[i];
 
                 var fileBytes = Convert.FromBase64String(base64File);
-                attCount++;
-                attBytes += fileBytes.Length;
-
                 var stream = new MemoryStream(fileBytes);
 
                 var file = new FormFile(stream, 0, fileBytes.Length, "file", fileFullName)
@@ -153,11 +280,10 @@ namespace MailConsumerRabbitMQ.Modals
             }
         }
 
-        private static void FillFilesFromBase64IfAny(MessageMQMailMultiple mail, ref int attCount, ref long attBytes)
+        private static void FillFilesFromBase64IfAny(MessageMQMailMultiple mail)
         {
             if (mail.fileByteArrays == null || mail.fileByteArrays.Count == 0) return;
 
-            // orijinal düzenine sadık: MailVM üstünden Files üretiliyor
             if (mail.MailVM == null) mail.MailVM = new MailVM();
             mail.MailVM.Files = new List<IFormFile>();
 
@@ -167,9 +293,6 @@ namespace MailConsumerRabbitMQ.Modals
                 var fileFullName = mail.fileFullName[i];
 
                 var fileBytes = Convert.FromBase64String(base64File);
-                attCount++;
-                attBytes += fileBytes.Length;
-
                 var stream = new MemoryStream(fileBytes);
 
                 var file = new FormFile(stream, 0, fileBytes.Length, "file", fileFullName)
@@ -194,7 +317,6 @@ namespace MailConsumerRabbitMQ.Modals
                 if (s.Length > max) s = s.Substring(0, max) + "...";
                 return s;
             }
-
             static string Safe(string? s, int max = 120) => OneLine(s, max);
 
             var started = DateTime.Now;
@@ -202,9 +324,6 @@ namespace MailConsumerRabbitMQ.Modals
 
             var to = Safe(_mail?.MailVM?.To, 200);
             var subject = Safe(_mail?.MailVM?.Subject, 200);
-            var smtp = Safe(_mail?.ExternalSmpt, 120);
-            var port = _mail?.ExternalPort ?? 0;
-            var ssl = _mail?.ExternalSsl ?? false;
 
             int attCount = 0;
             long attBytes = 0;
@@ -216,55 +335,45 @@ namespace MailConsumerRabbitMQ.Modals
                 mimeMessage.To.Add(MailboxAddress.Parse($"{_mail.MailVM.BoxName} <{_mail.MailVM.To}>"));
                 mimeMessage.Subject = _mail.MailVM.Subject;
 
-                var bodyBuilder = new BodyBuilder
+                var bodyBuilder = new BodyBuilder { HtmlBody = _mail.MailVM.Body };
+
+                FillFilesFromBase64IfAny(_mail);
+                if (_mail.MailVM.Files != null)
                 {
-                    HtmlBody = _mail.MailVM.Body
-                };
+                    attCount = _mail.MailVM.Files.Count;
+                    foreach (var f in _mail.MailVM.Files) attBytes += f?.Length ?? 0;
+                }
 
-                // Base64 attachment listesi varsa Files'a dönüştür
-                FillFilesFromBase64IfAny(_mail, ref attCount, ref attBytes);
-
-                // Files üzerinden ekle
                 AddAttachmentsFromMailVm(bodyBuilder, _mail.MailVM.Files);
-
                 mimeMessage.Body = bodyBuilder.ToMessageBody();
 
-                using var smtpClient = new SmtpClient();
-                smtpClient.CheckCertificateRevocation = true;
-
                 var host = _mail.ExternalSmpt;
-                var options = ResolveSocketOptions(host, _mail.ExternalPort, _mail.ExternalSsl);
+                var port = _mail.ExternalPort;
+                var ssl = _mail.ExternalSsl;
 
-                await smtpClient.ConnectAsync(host, _mail.ExternalPort, options);
-
-                // Gmail ise burada normal şifre değil App Password olmalı (ya da Workspace'te OAuth2)
-                await smtpClient.AuthenticateAsync(_mail.ExternalMailAddress, _mail.ExternalConnectionKey);
-
-                await smtpClient.SendAsync(mimeMessage);
-                await smtpClient.DisconnectAsync(true);
+                await SendWithSessionRetryAsync(
+                    host, port, ssl,
+                    _mail.ExternalMailAddress, _mail.ExternalConnectionKey,
+                    mimeMessage,
+                    logPrefix: $"[SMTP-SINGLE] to={to} sub=\"{subject}\"");
 
                 sw.Stop();
 
                 Console.WriteLine(
                     $"[Success] ts={started:yyyy-MM-dd HH:mm:ss.fff} no={sayac} durMs={sw.ElapsedMilliseconds} " +
-                    $"to={to} sub=\"{subject}\" smtp={smtp} port={port} ssl={ssl} att={attCount} bytes={attBytes}"
+                    $"to={to} sub=\"{subject}\" smtp={host} port={port} ssl={ssl} att={attCount} bytes={attBytes}"
                 );
 
                 sayac++;
             }
-            catch (Exception ex)
+            catch
             {
                 sw.Stop();
-
-                var errType = ex.GetType().Name;
-                var errMsg = Safe(ex.Message, 400);
-
                 Console.WriteLine(
                     $"[Fail] ts={started:yyyy-MM-dd HH:mm:ss.fff} no={sayac} durMs={sw.ElapsedMilliseconds} " +
-                    $"to={to} sub=\"{subject}\" smtp={smtp} port={port} ssl={ssl} att={attCount} bytes={attBytes} " +
-                    $"errType={errType} err=\"{errMsg}\""
+                    $"to={to} sub=\"{subject}\" smtp={_mail.ExternalSmpt} port={_mail.ExternalPort} ssl={_mail.ExternalSsl} " +
+                    $"att={attCount} bytes={attBytes}"
                 );
-
                 throw;
             }
         }
@@ -287,15 +396,11 @@ namespace MailConsumerRabbitMQ.Modals
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
             var subject = Safe(_mail?.MailMultiVM?.Subject, 200);
-            var smtp = Safe(_mail?.ExternalSmpt, 120);
-            var port = _mail?.ExternalPort ?? 0;
-            var ssl = _mail?.ExternalSsl ?? false;
 
             int attCount = 0;
             long attBytes = 0;
 
             int toCount = _mail?.MailMultiVM?.ToMultipleBoxAdress?.Count ?? 0;
-
             string toList = "";
             if (_mail?.MailMultiVM?.ToMultipleBoxAdress != null && _mail.MailMultiVM.ToMultipleBoxAdress.Count > 0)
             {
@@ -313,62 +418,50 @@ namespace MailConsumerRabbitMQ.Modals
 
                 mimeMessage.Subject = _mail.MailMultiVM.Subject;
 
-                var bodyBuilder = new BodyBuilder
-                {
-                    HtmlBody = _mail.MailMultiVM.Body
-                };
+                var bodyBuilder = new BodyBuilder { HtmlBody = _mail.MailMultiVM.Body };
 
-                // Base64 attachment listesi varsa MailVM.Files'a dönüştür
-                FillFilesFromBase64IfAny(_mail, ref attCount, ref attBytes);
+                FillFilesFromBase64IfAny(_mail);
 
-                // Multiple için: sende zaten _mail.MailMultiVM.Files var, orayı bozmayalım
-                // Ama base64'tan üretilen dosyaları da eklemek istiyorsan:
+                // base64'tan üretilen dosyalar
                 AddAttachmentsFromMailVm(bodyBuilder, _mail.MailVM?.Files);
 
-                // Orijinal davranış: MailMultiVM.Files varsa onları ekle
+                // MultiVM dosyaları
                 if (_mail.MailMultiVM.Files != null && _mail.MailMultiVM.Files.Count > 0)
-                {
                     AddAttachmentsFromMailVm(bodyBuilder, _mail.MailMultiVM.Files);
-                }
+
+                // sayım
+                if (_mail.MailVM?.Files != null) { attCount += _mail.MailVM.Files.Count; foreach (var f in _mail.MailVM.Files) attBytes += f?.Length ?? 0; }
+                if (_mail.MailMultiVM?.Files != null) { attCount += _mail.MailMultiVM.Files.Count; foreach (var f in _mail.MailMultiVM.Files) attBytes += f?.Length ?? 0; }
 
                 mimeMessage.Body = bodyBuilder.ToMessageBody();
 
-                using var smtpClient = new SmtpClient();
-                smtpClient.CheckCertificateRevocation = true;
-
                 var host = _mail.ExternalSmpt;
-                var options = ResolveSocketOptions(host, _mail.ExternalPort, _mail.ExternalSsl);
+                var port = _mail.ExternalPort;
+                var ssl = _mail.ExternalSsl;
 
-                await smtpClient.ConnectAsync(host, _mail.ExternalPort, options);
-
-                // Gmail ise burada normal şifre değil App Password olmalı (ya da Workspace'te OAuth2)
-                await smtpClient.AuthenticateAsync(_mail.ExternalMailAddress, _mail.ExternalConnectionKey);
-
-                await smtpClient.SendAsync(mimeMessage);
-                await smtpClient.DisconnectAsync(true);
+                await SendWithSessionRetryAsync(
+                    host, port, ssl,
+                    _mail.ExternalMailAddress, _mail.ExternalConnectionKey,
+                    mimeMessage,
+                    logPrefix: $"[SMTP-MULTI] toCount={toCount} to={toList} sub=\"{subject}\"");
 
                 sw.Stop();
 
                 Console.WriteLine(
                     $"[Success] ts={started:yyyy-MM-dd HH:mm:ss.fff} no={sayac} durMs={sw.ElapsedMilliseconds} " +
-                    $"toCount={toCount} to={toList} sub=\"{subject}\" smtp={smtp} port={port} ssl={ssl} att={attCount} bytes={attBytes}"
+                    $"toCount={toCount} to={toList} sub=\"{subject}\" smtp={host} port={port} ssl={ssl} att={attCount} bytes={attBytes}"
                 );
 
                 sayac++;
             }
-            catch (Exception ex)
+            catch
             {
                 sw.Stop();
-
-                var errType = ex.GetType().Name;
-                var errMsg = Safe(ex.Message, 400);
-
                 Console.WriteLine(
                     $"[Fail] ts={started:yyyy-MM-dd HH:mm:ss.fff} no={sayac} durMs={sw.ElapsedMilliseconds} " +
-                    $"toCount={toCount} to={toList} sub=\"{subject}\" smtp={smtp} port={port} ssl={ssl} att={attCount} bytes={attBytes} " +
-                    $"errType={errType} err=\"{errMsg}\""
+                    $"toCount={toCount} to={toList} sub=\"{subject}\" smtp={_mail.ExternalSmpt} port={_mail.ExternalPort} ssl={_mail.ExternalSsl} " +
+                    $"att={attCount} bytes={attBytes}"
                 );
-
                 throw;
             }
         }
