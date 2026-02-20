@@ -22,6 +22,16 @@ namespace MailConsumerRabbitMQ.Modals
         // SMTP session cache (host+port+user)
         private readonly ConcurrentDictionary<string, SmtpSession> _smtpSessions = new();
 
+        // Gmail throttle/circuit breaker (host+port+user)
+        private readonly ConcurrentDictionary<string, DateTime> _smtpBlockedUntilUtc = new();
+
+        // Queue names
+        private const string Q_MAIN = "mail_queue";
+        private const string Q_RETRY_1M = "mail_retry_1m";
+        private const string Q_RETRY_5M = "mail_retry_5m";
+        private const string Q_RETRY_15M = "mail_retry_15m";
+        private const string Q_DEAD = "mail_dead";
+
         public async Task InitializeAsync()
         {
             _factory = new ConnectionFactory
@@ -35,12 +45,58 @@ namespace MailConsumerRabbitMQ.Modals
             _connection = await _factory.CreateConnectionAsync();
             _channel = await _connection.CreateChannelAsync();
 
+            // MAIN
             await _channel.QueueDeclareAsync(
-                queue: "mail_queue",
+                queue: Q_MAIN,
                 durable: true,
                 exclusive: false,
                 autoDelete: false,
                 arguments: null);
+
+            // DEAD
+            await _channel.QueueDeclareAsync(
+                queue: Q_DEAD,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                arguments: null);
+
+            // RETRY (TTL + DLX -> main)
+            await _channel.QueueDeclareAsync(
+                queue: Q_RETRY_1M,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                arguments: new Dictionary<string, object>
+                {
+                    ["x-message-ttl"] = 60_000,
+                    ["x-dead-letter-exchange"] = "",
+                    ["x-dead-letter-routing-key"] = Q_MAIN
+                });
+
+            await _channel.QueueDeclareAsync(
+                queue: Q_RETRY_5M,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                arguments: new Dictionary<string, object>
+                {
+                    ["x-message-ttl"] = 300_000,
+                    ["x-dead-letter-exchange"] = "",
+                    ["x-dead-letter-routing-key"] = Q_MAIN
+                });
+
+            await _channel.QueueDeclareAsync(
+                queue: Q_RETRY_15M,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                arguments: new Dictionary<string, object>
+                {
+                    ["x-message-ttl"] = 900_000,
+                    ["x-dead-letter-exchange"] = "",
+                    ["x-dead-letter-routing-key"] = Q_MAIN
+                });
 
             // ✅ aynı anda çok mesaj çekip aynı SMTP hesabına abanmasın
             await _channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false);
@@ -50,18 +106,18 @@ namespace MailConsumerRabbitMQ.Modals
         {
             var consumer = new AsyncEventingBasicConsumer(_channel);
 
-            consumer.ReceivedAsync += async (model, ea) =>
+            consumer.ReceivedAsync += async (_, ea) =>
             {
-                var body = ea.Body.ToArray();
-                var message = Encoding.UTF8.GetString(body);
+                var body = ea.Body; // ReadOnlyMemory<byte>
+                var message = Encoding.UTF8.GetString(body.ToArray());
 
                 try
                 {
-                    var mailProperties = JsonConvert.DeserializeObject<MessageMQMail>(message);
+                    var mailSingle = JsonConvert.DeserializeObject<MessageMQMail>(message);
 
-                    if (mailProperties != null && mailProperties.MailVM != null)
+                    if (mailSingle != null && mailSingle.MailVM != null)
                     {
-                        await SendEmail(mailProperties);
+                        await SendEmail(mailSingle);
                     }
                     else
                     {
@@ -78,26 +134,43 @@ namespace MailConsumerRabbitMQ.Modals
                 {
                     Console.WriteLine($"Mail gönderme hatası: {ex.Message}");
 
-                    // ❌ requeue:true YOK
-                    // ✅ Mesaj kaybolmasın: ACK'leme.
-                    // ✅ RabbitMQ unacked mesajı geri alsın diye consumer bağlantısını resetliyoruz.
-                    try
+                    var retryCount = ReadRetryCount(ea.BasicProperties?.Headers);
+
+                    // Gmail 4.7.0 / temp auth problemleri => delayed retry
+                    if (IsGmailTooManyLogin(ex) || IsCircuitBreakException(ex))
                     {
-                        if (_channel != null && _channel.IsOpen)
-                            await _channel.CloseAsync();
+                        var targetQueue = retryCount switch
+                        {
+                            0 => Q_RETRY_1M,
+                            1 => Q_RETRY_5M,
+                            2 => Q_RETRY_15M,
+                            _ => Q_DEAD
+                        };
 
-                        if (_connection != null && _connection.IsOpen)
-                            await _connection.CloseAsync();
+                        await PublishWithRetryHeaderAsync(
+                            routingKey: targetQueue,
+                            body: ea.Body,
+                            originalProps: ea.BasicProperties,
+                            retryCount: retryCount + 1);
+
+                        // ✅ main mesajı ACK: restart loop/ban büyümesi biter
+                        await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+                        return;
                     }
-                    catch { /* ignore */ }
 
-                    // throw: servis/supervisor yeniden başlatıyorsa tekrar Initialize + Consume olur
-                    throw;
+                    // Diğer hatalar: direkt dead'e at (istersen buraya ayrıca retry stratejisi ekleriz)
+                    await PublishWithRetryHeaderAsync(
+                        routingKey: Q_DEAD,
+                        body: ea.Body,
+                        originalProps: ea.BasicProperties,
+                        retryCount: retryCount);
+
+                    await _channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
                 }
             };
 
             _channel.BasicConsumeAsync(
-                queue: "mail_queue",
+                queue: Q_MAIN,
                 autoAck: false,
                 consumer: consumer);
 
@@ -111,9 +184,6 @@ namespace MailConsumerRabbitMQ.Modals
         {
             public readonly SmtpClient Client = new();
             public readonly SemaphoreSlim Gate = new(1, 1);
-
-            public bool IsConnected => Client.IsConnected;
-            public bool IsAuthed => Client.IsAuthenticated;
 
             public async ValueTask DisposeAsync()
             {
@@ -129,23 +199,13 @@ namespace MailConsumerRabbitMQ.Modals
             }
         }
 
-        private string SessionKey(string host, int port, string user)
+        private static string SessionKey(string host, int port, string user)
             => $"{host}:{port}:{user}".ToLowerInvariant();
 
-        // -------------------------
-        // SMTP helpers (dinamik TLS)
-        // -------------------------
-        private static SecureSocketOptions ResolveSocketOptions(string? host, int port, bool externalSslFlag)
+        private static SecureSocketOptions ResolveSocketOptions(string host, int port, bool externalSslFlag)
         {
             if (port == 465) return SecureSocketOptions.SslOnConnect;
             if (port == 587) return SecureSocketOptions.StartTls;
-
-            if (!string.IsNullOrWhiteSpace(host) &&
-                host.Contains("gmail", StringComparison.OrdinalIgnoreCase))
-            {
-                return externalSslFlag ? SecureSocketOptions.SslOnConnect : SecureSocketOptions.StartTlsWhenAvailable;
-            }
-
             return externalSslFlag ? SecureSocketOptions.SslOnConnect : SecureSocketOptions.StartTlsWhenAvailable;
         }
 
@@ -153,27 +213,29 @@ namespace MailConsumerRabbitMQ.Modals
         {
             var s = ex.ToString();
             return s.Contains("4.7.0", StringComparison.OrdinalIgnoreCase) &&
-                   s.Contains("Too many login attempts", StringComparison.OrdinalIgnoreCase);
+                   (s.Contains("Too many login attempts", StringComparison.OrdinalIgnoreCase) ||
+                    s.Contains("Cannot authenticate due to a temporary system problem", StringComparison.OrdinalIgnoreCase) ||
+                    s.Contains("temporar", StringComparison.OrdinalIgnoreCase));
         }
 
-        private async Task<SmtpSession> GetOrCreateSessionAsync(string host, int port, bool ssl, string user, string pass)
+        private static bool IsCircuitBreakException(Exception ex)
+            => ex is SmtpProtocolException sp && sp.Message.StartsWith("CircuitBreak:", StringComparison.OrdinalIgnoreCase);
+
+        private async Task<SmtpSession> GetOrCreateSessionAsync(string host, int port, string user)
         {
             var key = SessionKey(host, port, user);
-
-            var session = _smtpSessions.GetOrAdd(key, _ => new SmtpSession());
-
-            // session'ı burada hemen connect etmiyoruz; send içinde lazy yapacağız.
-            // ama bozuk session olursa Remove edip yenisini kuracağız.
-            return session;
+            return _smtpSessions.GetOrAdd(key, _ => new SmtpSession());
         }
 
         private async Task EnsureConnectedAndAuthedAsync(SmtpSession session, string host, int port, bool ssl, string user, string pass)
         {
-            // Not: Gate ile dışarıdan serialize ediyoruz, burada paralel giriş yok.
             if (!session.Client.IsConnected)
             {
                 session.Client.CheckCertificateRevocation = true;
                 session.Client.Timeout = 60_000;
+
+                // AppPassword ile daha stabil (OAuth kullanmıyorsan kaldır)
+                session.Client.AuthenticationMechanisms.Remove("XOAUTH2");
 
                 var options = ResolveSocketOptions(host, port, ssl);
                 await session.Client.ConnectAsync(host, port, options);
@@ -185,63 +247,107 @@ namespace MailConsumerRabbitMQ.Modals
             }
         }
 
-        private async Task SendWithSessionRetryAsync(
-            string host, int port, bool ssl, string user, string pass,
+        private async Task SendWithSessionAsync(
+            string host, int port, bool ssl,
+            string user, string pass,
             MimeMessage mimeMessage,
             string logPrefix)
         {
-            var session = await GetOrCreateSessionAsync(host, port, ssl, user, pass);
             var key = SessionKey(host, port, user);
 
-            // kısa retry: aynı session ile dene; gerekiyorsa resetle
-            var delaysMs = new[] { 0, 1000, 2000, 4000 }; // 4 deneme
-
-            for (int attempt = 0; attempt < delaysMs.Length; attempt++)
+            // Circuit breaker: Gmail lock aldıysa bir süre dokunma
+            if (_smtpBlockedUntilUtc.TryGetValue(key, out var untilUtc) && untilUtc > DateTime.UtcNow)
             {
-                if (delaysMs[attempt] > 0)
-                    await Task.Delay(delaysMs[attempt]);
+                throw new SmtpProtocolException($"CircuitBreak: SMTP blocked until {untilUtc:o}");
+            }
 
-                await session.Gate.WaitAsync();
-                try
+            var session = await GetOrCreateSessionAsync(host, port, user);
+
+            await session.Gate.WaitAsync();
+            try
+            {
+                await EnsureConnectedAndAuthedAsync(session, host, port, ssl, user, pass);
+                await session.Client.SendAsync(mimeMessage);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"{logPrefix} err={ex.GetType().Name} msg={ex.Message}");
+
+                // Gmail 4.7.0 gelirse 10 dk blokla + session resetle
+                if (IsGmailTooManyLogin(ex) || !session.Client.IsConnected)
                 {
-                    // bağlı mı / authed mi kontrol et, değilse bağlan
-                    await EnsureConnectedAndAuthedAsync(session, host, port, ssl, user, pass);
+                    _smtpBlockedUntilUtc[key] = DateTime.UtcNow.AddMinutes(10);
 
-                    await session.Client.SendAsync(mimeMessage);
-
-                    // ✅ başarılı
-                    return;
+                    _smtpSessions.TryRemove(key, out _);
+                    try { await session.DisposeAsync(); } catch { /* ignore */ }
                 }
-                catch (Exception ex)
-                {
-                    var gmailThrottle = IsGmailTooManyLogin(ex);
 
-                    Console.WriteLine($"{logPrefix} attempt={attempt + 1}/{delaysMs.Length} err={ex.GetType().Name} msg={ex.Message}");
-
-                    // Gmail throttle / server disconnect gibi durumda session çoğu zaman bozulur.
-                    // Session'ı resetleyip bir sonraki attempt'te fresh connect yaptır.
-                    if (gmailThrottle || !session.Client.IsConnected)
-                    {
-                        // session'ı tamamen yenile
-                        _smtpSessions.TryRemove(key, out _);
-
-                        try { await session.DisposeAsync(); } catch { /* ignore */ }
-
-                        session = new SmtpSession();
-                        _smtpSessions[key] = session;
-                    }
-
-                    // son attempt ise throw
-                    if (attempt == delaysMs.Length - 1)
-                        throw;
-                }
-                finally
-                {
-                    session.Gate.Release();
-                }
+                throw;
+            }
+            finally
+            {
+                session.Gate.Release();
             }
         }
 
+        // -------------------------
+        // RabbitMQ publish helpers
+        // -------------------------
+        private static int ReadRetryCount(IDictionary<string, object>? headers)
+        {
+            if (headers == null) return 0;
+            if (!headers.TryGetValue("x-retry", out var v)) return 0;
+
+            try
+            {
+                if (v is byte[] b)
+                {
+                    var s = Encoding.UTF8.GetString(b);
+                    return int.TryParse(s, out var n) ? n : 0;
+                }
+                if (v is int i) return i;
+                if (v is long l) return (int)l;
+                if (v is string str) return int.TryParse(str, out var n) ? n : 0;
+            }
+            catch { /* ignore */ }
+
+            return 0;
+        }
+
+        private async Task PublishWithRetryHeaderAsync(
+            string routingKey,
+            ReadOnlyMemory<byte> body,
+            IReadOnlyBasicProperties? originalProps,
+            int retryCount)
+        {
+            // CreateBasicProperties yok -> BasicProperties kullan
+            var props = new BasicProperties
+            {
+                Persistent = true,
+                ContentType = originalProps?.ContentType ?? "application/json"
+            };
+
+            var headers = new Dictionary<string, object>();
+            if (originalProps?.Headers != null)
+            {
+                foreach (var kv in originalProps.Headers)
+                    headers[kv.Key] = kv.Value;
+            }
+
+            headers["x-retry"] = Encoding.UTF8.GetBytes(retryCount.ToString());
+            props.Headers = headers;
+
+            await _channel.BasicPublishAsync(
+                exchange: "",
+                routingKey: routingKey,
+                mandatory: false,
+                basicProperties: props,
+                body: body);
+        }
+
+        // -------------------------
+        // Attachment helpers
+        // -------------------------
         private static void AddAttachmentsFromMailVm(BodyBuilder bodyBuilder, IList<IFormFile>? files)
         {
             if (files == null || files.Count == 0) return;
@@ -347,13 +453,15 @@ namespace MailConsumerRabbitMQ.Modals
                 AddAttachmentsFromMailVm(bodyBuilder, _mail.MailVM.Files);
                 mimeMessage.Body = bodyBuilder.ToMessageBody();
 
-                var host = _mail.ExternalSmpt;
-                var port = _mail.ExternalPort;
-                var ssl = _mail.ExternalSsl;
+                var host = _mail.ExternalSmpt;  // smtp.gmail.com
+                var port = _mail.ExternalPort;  // 587
+                var ssl = _mail.ExternalSsl;    // false olsa bile 587 -> StartTls
+                var user = _mail.ExternalMailAddress;
+                var pass = _mail.ExternalConnectionKey; // ✅ App Password buraya
 
-                await SendWithSessionRetryAsync(
+                await SendWithSessionAsync(
                     host, port, ssl,
-                    _mail.ExternalMailAddress, _mail.ExternalConnectionKey,
+                    user, pass,
                     mimeMessage,
                     logPrefix: $"[SMTP-SINGLE] to={to} sub=\"{subject}\"");
 
@@ -369,11 +477,13 @@ namespace MailConsumerRabbitMQ.Modals
             catch
             {
                 sw.Stop();
+
                 Console.WriteLine(
                     $"[Fail] ts={started:yyyy-MM-dd HH:mm:ss.fff} no={sayac} durMs={sw.ElapsedMilliseconds} " +
                     $"to={to} sub=\"{subject}\" smtp={_mail.ExternalSmpt} port={_mail.ExternalPort} ssl={_mail.ExternalSsl} " +
                     $"att={attCount} bytes={attBytes}"
                 );
+
                 throw;
             }
         }
@@ -422,14 +532,11 @@ namespace MailConsumerRabbitMQ.Modals
 
                 FillFilesFromBase64IfAny(_mail);
 
-                // base64'tan üretilen dosyalar
                 AddAttachmentsFromMailVm(bodyBuilder, _mail.MailVM?.Files);
 
-                // MultiVM dosyaları
                 if (_mail.MailMultiVM.Files != null && _mail.MailMultiVM.Files.Count > 0)
                     AddAttachmentsFromMailVm(bodyBuilder, _mail.MailMultiVM.Files);
 
-                // sayım
                 if (_mail.MailVM?.Files != null) { attCount += _mail.MailVM.Files.Count; foreach (var f in _mail.MailVM.Files) attBytes += f?.Length ?? 0; }
                 if (_mail.MailMultiVM?.Files != null) { attCount += _mail.MailMultiVM.Files.Count; foreach (var f in _mail.MailMultiVM.Files) attBytes += f?.Length ?? 0; }
 
@@ -438,10 +545,12 @@ namespace MailConsumerRabbitMQ.Modals
                 var host = _mail.ExternalSmpt;
                 var port = _mail.ExternalPort;
                 var ssl = _mail.ExternalSsl;
+                var user = _mail.ExternalMailAddress;
+                var pass = _mail.ExternalConnectionKey; // ✅ App Password
 
-                await SendWithSessionRetryAsync(
+                await SendWithSessionAsync(
                     host, port, ssl,
-                    _mail.ExternalMailAddress, _mail.ExternalConnectionKey,
+                    user, pass,
                     mimeMessage,
                     logPrefix: $"[SMTP-MULTI] toCount={toCount} to={toList} sub=\"{subject}\"");
 
@@ -457,11 +566,13 @@ namespace MailConsumerRabbitMQ.Modals
             catch
             {
                 sw.Stop();
+
                 Console.WriteLine(
                     $"[Fail] ts={started:yyyy-MM-dd HH:mm:ss.fff} no={sayac} durMs={sw.ElapsedMilliseconds} " +
                     $"toCount={toCount} to={toList} sub=\"{subject}\" smtp={_mail.ExternalSmpt} port={_mail.ExternalPort} ssl={_mail.ExternalSsl} " +
                     $"att={attCount} bytes={attBytes}"
                 );
+
                 throw;
             }
         }
