@@ -19,7 +19,7 @@ namespace MailConsumerRabbitMQ.Modals
 
         public int sayac = 1;
 
-        // SMTP session cache (host+port+user)
+        // SMTP session cache (host+port+user)yeter
         private readonly ConcurrentDictionary<string, SmtpSession> _smtpSessions = new();
 
         // Gmail throttle/circuit breaker (host+port+user)
