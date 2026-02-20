@@ -253,11 +253,12 @@ namespace MailConsumerRabbitMQ.Modals
             MimeMessage mimeMessage,
             string logPrefix)
         {
-            var key = SessionKey(host, port, user);
 
             // Circuit breaker: Gmail lock aldıysa bir süre dokunma
+            var key = SessionKey(host, port, user);
             if (_smtpBlockedUntilUtc.TryGetValue(key, out var untilUtc) && untilUtc > DateTime.UtcNow)
             {
+                Console.WriteLine($"[CircuitBreak-HIT] smtpUser={user} host={host}:{port} blockedUntil={untilUtc:o}");
                 throw new SmtpProtocolException($"CircuitBreak: SMTP blocked until {untilUtc:o}");
             }
 
